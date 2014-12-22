@@ -17,6 +17,7 @@ limitations under the License.
 package memcache
 
 import (
+	"github.com/stathat/consistent"
 	"hash/crc32"
 	"net"
 	"strings"
@@ -111,4 +112,64 @@ func (ss *ServerList) PickServer(key string) (net.Addr, error) {
 	keyBufPool.Put(bufp)
 
 	return ss.addrs[cs%uint32(len(ss.addrs))], nil
+}
+
+type ConsistentServerList struct {
+	mu    sync.RWMutex
+	addrs map[string]net.Addr
+	ch    *consistent.Consistent
+}
+
+func (ss *ConsistentServerList) SetServers(servers ...string) error {
+	if ss.ch == nil {
+		ss.ch = consistent.New()
+	}
+	naddr := make([]net.Addr, len(servers))
+	for i, server := range servers {
+		if strings.Contains(server, "/") {
+			addr, err := net.ResolveUnixAddr("unix", server)
+			if err != nil {
+				return err
+			}
+			naddr[i] = addr
+		} else {
+			tcpaddr, err := net.ResolveTCPAddr("tcp", server)
+			if err != nil {
+				return err
+			}
+			naddr[i] = tcpaddr
+		}
+	}
+
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	for _, addr := range naddr {
+		ss.addrs[addr.Network()+addr.String()] = addr
+		ss.ch.Add(addr.Network() + addr.String())
+	}
+	return nil
+}
+
+func (ss *ConsistentServerList) Each(f func(net.Addr) error) error {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	for _, a := range ss.addrs {
+		if err := f(a); nil != err {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ss *ConsistentServerList) PickServer(key string) (net.Addr, error) {
+	ss.mu.RLock()
+	defer ss.mu.RUnlock()
+	if len(ss.addrs) == 0 {
+		return nil, ErrNoServers
+	}
+	name, err := ss.ch.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	return ss.addrs[name], nil
 }
